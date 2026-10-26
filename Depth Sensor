@@ -1,0 +1,36 @@
+const int trigPin = A3;
+const int echoPin = A4;
+const float sensorToBottomMm = 62.0;
+
+void setup() {
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  Serial.begin(9600);
+}
+
+void loop() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, 30000);
+
+  if (duration == 0) {
+    Serial.println("No echo");
+  } else {
+    float distanceToWaterMm = duration * 0.343 / 2;
+    float waterDepthMm = sensorToBottomMm - distanceToWaterMm;
+
+    if (waterDepthMm < 0) {
+      Serial.println("Check sensor position");
+    } else {
+      Serial.print("Water depth: ");
+      Serial.print(waterDepthMm);
+      Serial.println(" mm");
+    }
+  }
+
+  delay(500);
+}
