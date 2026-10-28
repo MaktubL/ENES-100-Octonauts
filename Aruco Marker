@@ -1,0 +1,35 @@
+#include <Enes100.h>
+void setup() {
+  Enes100.begin("Octonauts", WATER, 106, 1116);
+  Enes100.println("Connected...");
+  Enes100.println();
+  
+
+  float currentX = Enes100.getX();
+  float currentY = Enes100.getY();
+  float currentTheta = Enes100.getTheta();
+  
+    Enes100.print("X: ");
+  Enes100.print(currentX);
+  
+  Enes100.print(" | Y: ");
+  Enes100.print(currentY);
+  
+  Enes100.print(" | Theta: ");
+  Enes100.println(currentTheta); 
+}
+
+void loop() {
+  float currentX = Enes100.getX();
+  float currentY = Enes100.getY();
+  float currentTheta = Enes100.getTheta();
+  
+    Enes100.print("X: ");
+  Enes100.print(currentX);
+  
+  Enes100.print(" | Y: ");
+  Enes100.print(currentY);
+  
+  Enes100.print(" | Theta: ");
+  Enes100.println(currentTheta);
+  }
