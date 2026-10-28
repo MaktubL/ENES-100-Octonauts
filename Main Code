@@ -1,1 +1,201 @@
+#include <Arduino.h>
+#include "Config.h"
 
+// Approximate usable HC-SR04 measurement range.
+// Verify these limits against your actual sensors and setup.
+constexpr float MIN_VALID_DISTANCE_MM = 20.0f;
+constexpr float MAX_VALID_DISTANCE_MM = 4000.0f;
+
+// Leave time between two ultrasonic measurements to reduce
+// the risk of one sensor detecting the other's echo.
+constexpr unsigned long ULTRASONIC_SENSOR_GAP_MS = 60;
+
+// Diagnostic output interval.
+constexpr unsigned long DIAGNOSTIC_INTERVAL_MS = 500;
+
+// Ensure the installation height is configured correctly.
+static_assert(SENSOR_TO_BOTTOM_MM > 0.0f,
+              "SENSOR_TO_BOTTOM_MM must be greater than zero.");
+
+// TODO: Integrate ENES100 library and Wi-Fi client initialization to fetch real-time (x, y, theta) positioning data.
+
+// Shared ultrasonic measurement function
+// Returns false if the measurement is missing or invalid.
+bool readDistanceMm(int trigPin, int echoPin, float &distanceMm) {
+    // Send a short trigger pulse.
+    digitalWrite(trigPin, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    // Measure the echo pulse duration.
+    const unsigned long duration =
+        pulseIn(echoPin, HIGH, ECHO_TIMEOUT_US);
+
+    // A duration of zero means no echo arrived before timeout.
+    if (duration == 0) {
+        return false;
+    }
+
+    // Convert round-trip travel time into one-way distance.
+    const float measuredDistanceMm =
+        duration * SOUND_SPEED_MM_PER_US / 2.0f;
+
+    // Reject measurements outside the configured usable range.
+    if (measuredDistanceMm < MIN_VALID_DISTANCE_MM ||
+        measuredDistanceMm > MAX_VALID_DISTANCE_MM) {
+        return false;
+    }
+
+    distanceMm = measuredDistanceMm;
+    return true;
+}
+
+// Front ultrasonic sensor
+bool readFrontDistanceMm(float &distanceMm) {
+    return readDistanceMm(
+        FRONT_TRIG_PIN,
+        FRONT_ECHO_PIN,
+        distanceMm
+    );
+}
+
+// Downward ultrasonic sensor
+bool readWaterDistanceMm(float &distanceMm) {
+    return readDistanceMm(
+        DOWN_TRIG_PIN,
+        DOWN_ECHO_PIN,
+        distanceMm
+    );
+}
+
+// TODO: Implement GY-31 color sensor pulse frequency reading functions using COLOR_OUT_PIN and COLOR_S3_PIN.
+
+// TODO: Implement water pump control functions using WATER_PUMP_PIN and PUMP_RELAY_PIN.
+
+// TODO: Implement L298N motor direction and movement control functions (moveForward, moveBackward, turnLeft, turnRight) using MOTOR_IN3_PIN, MOTOR_IN4_PIN, MOTOR_ENA_PIN, and MOTOR_ENB_PIN.
+
+// Motor safety stop
+// This disables the two L298N enable channels.
+void stopMotors() {
+    analogWrite(MOTOR_ENA_PIN, 0);
+    analogWrite(MOTOR_ENB_PIN, 0);
+}
+
+// Setup
+void setup() {
+    Serial.begin(9600);
+
+    // Front ultrasonic sensor.
+    pinMode(FRONT_TRIG_PIN, OUTPUT);
+    pinMode(FRONT_ECHO_PIN, INPUT);
+    digitalWrite(FRONT_TRIG_PIN, LOW);
+
+    // Downward ultrasonic sensor.
+    pinMode(DOWN_TRIG_PIN, OUTPUT);
+    pinMode(DOWN_ECHO_PIN, INPUT);
+    digitalWrite(DOWN_TRIG_PIN, LOW);
+
+    // L298N control pins currently defined in Config.h[cite: 1].
+    pinMode(MOTOR_IN3_PIN, OUTPUT);
+    pinMode(MOTOR_IN4_PIN, OUTPUT);
+    pinMode(MOTOR_ENA_PIN, OUTPUT);
+    pinMode(MOTOR_ENB_PIN, OUTPUT);
+
+    // TODO: Initialize GY-31 color sensor pin modes (e.g., COLOR_OUT_PIN as INPUT, COLOR_S3_PIN as OUTPUT).
+    
+    // TODO: Initialize water pump / relay pin modes (e.g., WATER_PUMP_PIN or PUMP_RELAY_PIN as OUTPUT).
+
+    // TODO: Initialize ENES100 communication protocol.
+
+    // Diagnostic mode: motors remain disabled.
+    stopMotors();
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("OTV Sensor Diagnostic Mode");
+    Serial.println("Front obstacle sensor: enabled");
+    Serial.println("Downward water measurement: enabled");
+    Serial.println("Motors: disabled for safety");
+    Serial.println("========================================");
+}
+
+// Main loop
+// Diagnostic mode only: no autonomous movement is commanded.
+void loop() {
+    // TODO: Replace this diagnostic loop with a robust state machine structure (e.g., IDLE, NAVIGATING, MEASURING, PUMPING, FINISHED).
+
+    // Keep motors disabled during sensor bring-up.
+    stopMotors();
+
+    // Phase 1: Front obstacle measurement
+    float frontDistanceMm = 0.0f;
+    const bool frontValid = readFrontDistanceMm(frontDistanceMm);
+
+    Serial.print("[Front] ");
+
+    if (!frontValid) {
+        Serial.println("No valid measurement.");
+
+        // Do not allow a future motor-control integration to
+        // assume the path is clear when the sensor fails.
+        stopMotors();
+    } else {
+        Serial.print("Distance = ");
+        Serial.print(frontDistanceMm, 1);
+        Serial.println(" mm");
+
+        if (frontDistanceMm < OBSTACLE_STOP_DISTANCE_MM) {
+            stopMotors();
+            Serial.println("[Front] Obstacle threshold reached.");
+            // TODO: Add obstacle avoidance or wait-and-retry behavior here.
+        }
+    }
+
+    // Separate measurements to reduce ultrasonic crosstalk.
+    delay(ULTRASONIC_SENSOR_GAP_MS);
+
+    // Phase 2: Downward distance and estimated water depth
+    float waterDistanceMm = 0.0f;
+    const bool waterDistanceValid =
+        readWaterDistanceMm(waterDistanceMm);
+
+    Serial.print("[Water] ");
+
+    if (!waterDistanceValid) {
+        Serial.println(
+            "No valid measurement. Check sensor alignment, "
+            "water-surface reflection, and wiring."
+        );
+    } else {
+        Serial.print("Distance to water surface = ");
+        Serial.print(waterDistanceMm, 1);
+        Serial.println(" mm");
+
+        const float waterDepthMm =
+            SENSOR_TO_BOTTOM_MM - waterDistanceMm;
+
+        if (waterDepthMm < 0.0f) {
+            Serial.println(
+                "[Water] Invalid depth: measured distance "
+                "exceeds the configured installation height."
+            );
+        } else {
+            Serial.print("[Water] Estimated depth = ");
+            Serial.print(waterDepthMm, 1);
+            Serial.println(" mm");
+            
+            // TODO: Record or transmit the measured water depth once the target zone is reached.
+        }
+    }
+
+    // TODO: Add ENES100 coordinate checking (x, y) to verify arrival at target zones.
+
+    // TODO: Add color sensor reading logic when positioned at target areas.
+
+    Serial.println("----------------------------------------");
+
+    delay(DIAGNOSTIC_INTERVAL_MS);
+}
