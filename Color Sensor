@@ -1,0 +1,44 @@
+const int outPin = 2;
+const int s0Pin = 7;
+const int s1Pin = 8;
+const int s2Pin = 11;
+const int s3Pin = 12;
+const int ledPin = 4;
+
+unsigned long readColor(int s2State, int s3State) {
+  digitalWrite(s2Pin, s2State);
+  digitalWrite(s3Pin, s3State);
+  delay(50);
+
+  return pulseIn(outPin, LOW, 100000);
+}
+
+void setup() {
+  pinMode(outPin, INPUT);
+  pinMode(s0Pin, OUTPUT);
+  pinMode(s1Pin, OUTPUT);
+  pinMode(s2Pin, OUTPUT);
+  pinMode(s3Pin, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+
+  digitalWrite(ledPin, HIGH);  // Turn on the sensor's lights.
+  digitalWrite(s0Pin, HIGH);
+  digitalWrite(s1Pin, LOW);    // Set output frequency to 20% scale.
+
+  Serial.begin(9600);
+}
+
+void loop() {
+  unsigned long redReading = readColor(LOW, LOW);
+  unsigned long blueReading = readColor(LOW, HIGH);
+  unsigned long greenReading = readColor(HIGH, HIGH);
+
+  Serial.print("Red: ");
+  Serial.print(redReading);
+  Serial.print("  Green: ");
+  Serial.print(greenReading);
+  Serial.print("  Blue: ");
+  Serial.println(blueReading);
+
+  delay(500);
+}
