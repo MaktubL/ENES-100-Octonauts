@@ -1,68 +1,57 @@
-# ENES-100 Octonauts — UNO R4 WiFi / Water Mission
+ENES-100 Octonauts — UNO R4 WiFi / Water Mission
 
-本工程对应你们的九项阶段考核，包含 **无障碍导航** 和 **有障碍导航** 两个独立模式。代码中的 `[CONFIG]`、`[INTEGRATION]`、`[MOTORS]`、`[REAL SENSOR]`、`[NAVIGATION CORE]` 等批注解释了修改原因与硬件假设。
+This project corresponds to your nine-part stage assessment and includes two independent modes: **obstacle-free navigation** and **obstacle navigation**. Comments in the code, such as `[CONFIG]`, `[INTEGRATION]`, `[MOTORS]`, `[REAL SENSOR]`, and `[NAVIGATION CORE]`, explain the reasons for modifications and hardware assumptions.
 
-## 在 VS Code 中打开什么
+What to Open in VS Code
+- `src/main.cpp`: The main program compiled by PlatformIO.
+- `Config.h`: Your pin assignments, calibration, vehicle dimensions, route, and hardware verification switches.
+- `include/Navigator.h`: A* planning with a fixed memory limit and obstacle surface point logging.
+- `simulator/main.py`: Copy this to your specified MicroPython website to run; it cannot be uploaded to the UNO R4.
+- `docs/Assessment_CN.md`: Nine requirements, on-site procedures, and items that still require physical verification.
+- `test/test_navigator.cpp`, `test/test_simulator.py`: Navigation core and offline scenario testing.
 
-- `src/main.cpp`：实际由 PlatformIO 编译的整合主程序。
-- `Config.h`：你们的引脚、校准、车身尺寸、路线和硬件确认开关。
-- `include/Navigator.h`：有固定内存上限的 A* 规划与障碍表面点记录。
-- `simulator/main.py`：复制到你指定的 MicroPython 网站运行；不能上传到 UNO R4。
-- `docs/Assessment_CN.md`：九项要求、现场步骤、哪些仍需实物验证。
-- `test/test_navigator.cpp`、`test/test_simulator.py`：导航核心和离线场景检查。
+The original Aruco Marker, Color Sensor Code, and Depth Sensor Code are retained for team members’ reference. The original `Main Code` did not have a `.cpp` extension and was not located in the `src` directory, so PlatformIO would not automatically compile it into the main program; now, it is uniformly built from `src/main.cpp`.
 
-原有 Aruco Marker、Color Sensor Code、Depth Sensor Code 保留作组员参考。原来的 `Main Code` 没有 `.cpp` 扩展名，也不在 `src` 目录，PlatformIO 不会自动把它编译成主程序；现在统一从 `src/main.cpp` 构建。
+Test navigation in the simulator first
+1. Open `simulator/main.py` and copy all content to `https://enes100.umd.edu/tools/micropythonsimulator/`.
+2. Obstacle-free test: `MODE=“NAVIGATION”`, `ENABLE_AVOIDANCE=False`; click Randomize → Remove Obstacles → Run.
+3. Obstacle-included test: `MODE=“NAVIGATION”`, `ENABLE_AVOIDANCE=True`; click Randomize → Run.
+4. Turning: `MODE=“TURN_TEST”`; observe the 90° arrival information at 1/3, 2/3, and 3/3.
+5. Wireless Interface Test: `MODE=“WIRELESS_TEST”`; set `SEND_DEMO_MISSION=True` only when you need to send a test message.
 
-## 先在模拟器测试导航
+The `enes100`, `tank`, and mission constants are already built into the webpage; do not copy Arduino functions such as `digitalWrite()` into MicroPython. Keep the web page visible; runs where the backend timer continues but the screen is paused must be retested and cannot be counted as passes.
 
-1. 打开 `simulator/main.py`，复制全部内容到 https://enes100.umd.edu/tools/micropythonsimulator/。
-2. 无障碍考核：`MODE="NAVIGATION"`，`ENABLE_AVOIDANCE=False`；点击 Randomize → Remove Obstacles → Run。
-3. 有障碍考核：`MODE="NAVIGATION"`，`ENABLE_AVOIDANCE=True`；点击 Randomize → Run。
-4. 转弯：`MODE="TURN_TEST"`；观察 1/3、2/3、3/3 的 90° 到达信息。
-5. 无线接口流程：`MODE="WIRELESS_TEST"`；需要发送测试消息时才设 `SEND_DEMO_MISSION=True`。
+Mission points are still to be confirmed: The current web page source code does not include the Water Mission coordinates. `MISSION_POINT=None` selects only the demonstration approach point opposite the starting point; the log will provide a clear prompt. Replace this with `(x,y)` once the official locations are known. The default finish point is `(3.15,1.45)`, located ahead of the x≈3.4 log/limbo mark drawn on the webpage. Do not treat the demonstration proximity point as a confirmed official location.
 
-网页的 `enes100`、`tank` 与任务常量已经内置，不要把 Arduino 的 `digitalWrite()` 等函数粘贴到 MicroPython 中。保持网页可见；后端计时继续而画面暂停的运行应重测，不能记为通过。
+Real-world Use
+After building on PlatformIO, upload to the UNO R4 WiFi; set the serial port to 9600 baud, and ensure commands end with a line break. The robot will not move automatically upon power-up. Press `q` to request a stop without waiting for a line feed; the physical kill switch is still used to cut off the drive power.
 
-**任务点尚待确认**：当前网页源码没有 Water Mission 坐标。`MISSION_POINT=None` 只选择起点对面的演示接近点，日志会明确提示。知道正式位置后替换为 `(x,y)`。终点默认 `(3.15,1.45)`，在网页绘制的 x≈3.4 log/limbo 前方。不得把演示接近点当作已经确认的正式站点。
-
-## 实车使用
-
-PlatformIO Build 后上传到 UNO R4 WiFi；串口设 9600 baud，命令以换行结束。上电不会自动移动。`q` 不需要等待换行，即可请求停止；实体 kill switch 仍用于切断驱动电源。
-
-| 命令 | 功能 |
+| Command | Function |
 |---|---|
-| `h` | 显示菜单 |
-| `d` | ArUco、前方与向下超声波诊断 |
-| `w` | 周期性读取并显示 X/Y/theta，同时输出到 Vision System |
-| `x` | 明确标注的 25 mm 测试任务消息，不是实际水深 |
-| `f` | 导航至 pre-limbo 的 X 坐标，记录实际位移与耗时 |
-| `t` | 从初始 heading 起连续完成三个相对 90° 转弯 |
-| `n` | 无障碍：当前位置 → 已确认任务接近点 → limbo/log 前 |
-| `a` | 有障碍：前方探头扫描、记录表面、规划绕行并完成同一路线 |
-| `k 200` | 已知 200 mm 处测 10 次，输出误差和有效读数率 |
-| `c` | 输出 R/G/B/clear 原始频率和 LDR，供任务感知校准 |
-| `m` | 七次水深测量；至少五次有效且稳定、校准已确认才提交任务结果 |
-| `p` | 有上限的水泵通电控制测试，默认 1500 ms |
-| `q` | 停止电机、水泵，回到 IDLE |
+| `h` | Display menu |
+| `d` | ArUco, front, and downward ultrasonic diagnostics |
+| `w` | Periodically reads and displays X/Y/theta, while outputting to the Vision System |
+| `x` | Explicitly labeled 25 mm test task message; not actual water depth |
+| `f` | Navigate to the X-coordinate of pre-limbo; record actual displacement and elapsed time |
+| `t` | Perform three consecutive 90° turns relative to the initial heading |
+| `n` | Obstacle-free: Current position → Confirmed task approach point → Before limbo/log |
+| `a` | Obstacle present: Scan with forward sensor, record surface, plan a detour, and complete the same route |
+| `k 200` | Take 10 measurements at the known 200 mm mark; output error and valid reading rate |
+| `c` | Output raw R/G/B/clear frequencies and LDR values for task perception calibration |
+| `m` | Seven water depth measurements; submit task results only after at least five valid and stable readings, with calibration confirmed |
+| `p` | Pump power-on control test with an upper limit; default 1500 ms |
+| `q` | Stop motors and pump, return to IDLE |
 
-### 当前默认开关
+Current default settings
+`MOTOR_WIRING_CONFIRMED=false`, `OTV_GEOMETRY_CONFIRMED=false`, `PUMP_WIRING_CONFIRMED=false`, `FRONT_CALIBRATED=false`, `DEPTH_CALIBRATED=false`, `MISSION_POINT_CONFIRMED=false`.
+These default values indicate facts that require verification; do not set them all to `true` just to make the program run. You do not need to fill in the wiring from memory at this stage; you can verify each item on-site. You may proceed with stationary readings, wireless interface setup, color calibration, and water depth sampling first. The system will provide prompts regarding any unconfirmed configurations during autonomous vehicle movement, pump operation, and formal measurement submission.
+On a standard L298N, IN3/IN4 control the direction of the same motor, while ENB controls its speed. The missing IN1/IN2 pins are explicitly reserved with a value of -1. After confirming the actual board layout, fill in the direction pins, left/right channels, and forward/reverse polarity; check the ENA/ENB jumpers and common ground to avoid assigning the same pin to two components.
+Confirm whether the water pump is controlled by the D13 relay or the external driver on D10, verify the active levels, and then enable `PUMP_WIRING_CONFIRMED`. The default input state does not guarantee that the external relay is off; disconnect the water pump load before performing stationary diagnostics. The program will not drive the motor or water pump by connecting them directly to the Arduino’s power supply pins.
 
-`MOTOR_WIRING_CONFIRMED=false`、`OTV_GEOMETRY_CONFIRMED=false`、`PUMP_WIRING_CONFIRMED=false`、`FRONT_CALIBRATED=false`、`DEPTH_CALIBRATED=false`、`MISSION_POINT_CONFIRMED=false`。
+Regarding 3.4 m
+The **actual travel distance of 3.4 m** specified in the requirements is not the same as the **x=3.4 m** coordinate on the map. The default starting point on the webpage is x=0.55; traveling to x=3.15 is only approximately 2.60 m. `f` will accurately print the planned and actual displacements and indicate that the distance is less than 3.4 m; this cannot be used to claim that the first requirement has been met. The first requirement allows for obstacle removal and manual vehicle assistance; proof must be provided using a ruler and stopwatch over the actual distance specified by the instructor.
 
-这些默认值表示待验证的事实，不能为了让程序运行就全部改成 true。现在不需要你凭记忆补充接线；到了现场逐项核实即可。静止读数、无线接口、颜色和水深采样可以先进行。实车自主移动、水泵和正式测量提交会对相应未确认配置给出提示。
-
-标准 L298N 的 IN3/IN4 控制同一电机方向，ENB 控制它的速度。缺失的 IN1/IN2 用 -1 明确保留。确认实际板型后填写两个方向引脚、左右通道和正反转极性；检查 ENA/ENB 跳线和共地，避免把同一引脚分配给两个部件。
-
-确认水泵是由 D13 继电器控制，还是 D10 的外部驱动器控制，并核对有效电平，再启用 `PUMP_WIRING_CONFIRMED`。默认输入状态不保证外部继电器断开；静止诊断时先断开水泵负载。程序不会把电机或水泵直接接到 Arduino 供电引脚上驱动。
-
-### 关于 3.4 m
-
-要求中的 **实际行驶 3.4 m** 与地图的 **x=3.4 m** 不是同一个量。网页默认起点 x=.55，行驶到 x=3.15 只有约 2.60 m。`f` 会如实打印计划和实际位移，并提示不足 3.4 m；不能以此声称已经通过第一项。第一项允许移除障碍、人工接车，应在老师规定的实车距离上用尺子和计时器完成证明。
-
-## 验证与限制
-
-原阶段的网页默认场景完整导航曾到达约 (3.102,1.415)，日志耗时 118303 ms。原 Python 控制器的 30 个随机障碍场景、4 个无障碍场景和4个三次转弯场景通过离线检查；离线模型不含 rumble 随机扰动、真实超声波盲区、车轮打滑及网络延迟。
-
-本次新增的 C++ 导航核心通过独立主机检查：角度跨越 ±π、空场地路线、无效目标、障碍绕行、路段间距、去重、墙面过滤、地图容量上限。导航核心对象约 6.2 KB；WiFi/RTOS 的额外内存需以实际 UNO R4 编译和运行结果为准。
-
-还没有完成实车上传、实际 3.4 m 行驶、实物校准、泵取水量测试；代码与模拟器不能替代这些演示。更多测试证据见 `docs/Verification_CN.md`。
+Verification and Limitations
+In the previous phase, the default web-based scenario’s full navigation reached approximately (3.102, 1.415), with a log time of 118,303 ms. The original Python controller passed offline verification for 30 random obstacle scenarios, 4 obstacle-free scenarios, and 4 triple-turn scenarios; the offline model does not include random rumble disturbances, real ultrasonic blind spots, wheel slippage, or network latency.
+The newly added C++ navigation core passed verification on a standalone host, covering: angle ranges of ±π, open-field routes, invalid targets, obstacle avoidance, segment spacing, deduplication, wall filtering, and map capacity limits. The navigation core object is approximately 6.2 KB; additional memory requirements for WiFi/RTOS depend on the actual compilation and runtime results on the UNO R4.
+The following tests have not yet been completed: real-vehicle upload, actual 3.4 m driving, physical calibration, and pump water intake testing; the code and simulator cannot replace these demonstrations. For more test evidence, see `docs/Verification_CN.md`.
