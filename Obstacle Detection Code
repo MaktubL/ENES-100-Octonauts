@@ -1,0 +1,38 @@
+const int trigPin = A1;
+const int echoPin = A2;
+
+const float obstacleThreshold = 150.0;
+
+void setup() {
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  Serial.begin(9600);
+}
+
+void loop() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+
+  if (duration == 0) {
+    Serial.println("No echo detected");
+  } else {
+    float distanceMm = duration * 0.343 / 2.0;
+
+    Serial.print("Distance: ");
+    Serial.print(distanceMm);
+    Serial.println(" mm");
+
+    if (distanceMm <= obstacleThreshold) {
+      Serial.println("OBSTACLE DETECTED!");
+    } else {
+      Serial.println("Path clear");
+    }
+  }
+
+  delay(200);
+}
