@@ -1,0 +1,231 @@
+#include "Enes100.h"
+#include "Tank.h"
+#include <math.h>
+
+struct Point {
+  float x;
+  float y;
+};
+
+struct Pose {
+  float x;
+  float y;
+  float heading;
+};
+
+const Point SQUARE_A = {0.286f, 1.597f};
+const Point SQUARE_B = {0.276f, 0.434f};
+
+const float START_RADIUS_M = 0.18f;
+const float ARRIVAL_RADIUS_M = 0.06f;
+const float CLEARANCE_M = 0.30f;
+const float HEADING_OFFSET = PI / 2.0f;
+const float TRAVEL_TOLERANCE = 8.0f * PI / 180.0f;
+const float ALIGN_TOLERANCE = 1.5f * PI / 180.0f;
+
+const int TURN_PWM = 160;
+const int DRIVE_PWM = 160;
+const unsigned long TURN_TIMEOUT_MS = 15000UL;
+const unsigned long TRANSFER_TIMEOUT_MS = 30000UL;
+
+float wrapAngle(float angle) {
+  return atan2(sin(angle), cos(angle));
+}
+
+bool readPose(Pose &pose) {
+  if (!Enes100.isConnected()) return false;
+
+  float x = Enes100.getX();
+  float y = Enes100.getY();
+  float theta = Enes100.getTheta();
+
+  if (!Enes100.isVisible() ||
+      !isfinite(x) || !isfinite(y) || !isfinite(theta) ||
+      x < 0.0f || x > 4.0f || y < 0.0f || y > 2.0f ||
+      theta < -PI || theta > PI) {
+    return false;
+  }
+
+  pose.x = x;
+  pose.y = y;
+  pose.heading = wrapAngle(theta + HEADING_OFFSET);
+  return true;
+}
+
+float distanceTo(const Pose &pose, const Point &point) {
+  float dx = point.x - pose.x;
+  float dy = point.y - pose.y;
+  return sqrt(dx * dx + dy * dy);
+}
+
+void printPose(const char *label, const Pose &pose) {
+  Enes100.print(label);
+  Enes100.print(" X(m)=");
+  Enes100.print(pose.x);
+  Enes100.print(" Y(m)=");
+  Enes100.print(pose.y);
+  Enes100.print(" Heading(deg)=");
+  Enes100.println(pose.heading * 180.0f / PI);
+}
+
+bool hasClearance(int sensorId) {
+  float distance = Tank.readDistanceSensor(sensorId);
+  if (isfinite(distance) && distance >= CLEARANCE_M) return true;
+
+  Enes100.print("STOP: clearance check failed. Sensor ");
+  Enes100.print(sensorId);
+  Enes100.print(" distance (m): ");
+  Enes100.println(distance);
+  return false;
+}
+
+// 所有定位和测距读取都在电机停止时进行。
+void motorPulse(int leftPWM, int rightPWM, unsigned long durationMs) {
+  Tank.setLeftMotorPWM(leftPWM);
+  Tank.setRightMotorPWM(rightPWM);
+  delay(durationMs);
+  Tank.turnOffMotors();
+}
+
+// 正误差向左转，负误差向右转。
+void turnPulse(float error) {
+  float errorDeg = fabs(error) * 180.0f / PI;
+  unsigned long durationMs = 45UL;
+
+  if (errorDeg > 15.0f) {
+    durationMs = 180UL;
+  } else if (errorDeg > 5.0f) {
+    durationMs = 90UL;
+  }
+
+  int direction = error > 0.0f ? 1 : -1;
+  motorPulse(-direction * TURN_PWM, direction * TURN_PWM, durationMs);
+  delay(450);
+}
+
+bool driveToSquare(const Point &target, Pose &pose) {
+  const unsigned long started = millis();
+
+  while (millis() - started < TRANSFER_TIMEOUT_MS) {
+    if (!readPose(pose)) {
+      Enes100.println("STOP: Marker 106 unavailable during transfer.");
+      return false;
+    }
+
+    float distance = distanceTo(pose, target);
+    if (distance <= ARRIVAL_RADIUS_M) return true;
+
+    // 每次短转或前进后，都根据新位置重新计算目标方向。
+    float bearing = atan2(target.y - pose.y, target.x - pose.x);
+    float error = wrapAngle(bearing - pose.heading);
+
+    if (fabs(error) > TRAVEL_TOLERANCE) {
+      if (!hasClearance(1) || !hasClearance(7)) return false;
+      turnPulse(error);
+      continue;
+    }
+
+    if (!hasClearance(1)) return false;
+
+    int correction = constrain((int)round(100.0f * error), -25, 25);
+    unsigned long durationMs = distance > 0.20f ? 220UL : 100UL;
+    motorPulse(DRIVE_PWM - correction, DRIVE_PWM + correction, durationMs);
+    delay(150);
+  }
+
+  Enes100.println("STOP: transfer timed out before reaching target square.");
+  return false;
+}
+
+bool alignToPositiveX(Pose &pose) {
+  const unsigned long started = millis();
+  int alignedSamples = 0;
+
+  while (millis() - started < TURN_TIMEOUT_MS) {
+    if (!readPose(pose)) {
+      Enes100.println("STOP: Marker 106 unavailable during +X alignment.");
+      return false;
+    }
+
+    float error = wrapAngle(-pose.heading);
+    if (fabs(error) <= ALIGN_TOLERANCE) {
+      if (++alignedSamples >= 3) return true;
+      delay(200);
+      continue;
+    }
+
+    alignedSamples = 0;
+    if (!hasClearance(1) || !hasClearance(7)) return false;
+    turnPulse(error);
+  }
+
+  Enes100.println("STOP: +X alignment timed out.");
+  return false;
+}
+
+void setup() {
+  Tank.begin();
+  Tank.turnOffMotors();
+  Enes100.begin("AB106", MATERIAL, 106, 1116, 52, 50);
+
+  Enes100.println("AB106 V2: A/B transfer test");
+  Enes100.println("Starting in 5 seconds.");
+  delay(5000);
+
+  Pose pose;
+  bool poseReady = false;
+  const unsigned long waitStarted = millis();
+
+  while (millis() - waitStarted < 15000UL) {
+    if (readPose(pose)) {
+      poseReady = true;
+      break;
+    }
+    delay(250);
+  }
+
+  if (!poseReady) {
+    Enes100.println("STOP: initial Marker 106 pose unavailable.");
+    return;
+  }
+
+  printPose("Initial pose:", pose);
+
+  bool inA = distanceTo(pose, SQUARE_A) <= START_RADIUS_M;
+  bool inB = distanceTo(pose, SQUARE_B) <= START_RADIUS_M;
+
+  if (inA == inB) {
+    Enes100.println("STOP: start not identified. Place Marker near A or B center.");
+    return;
+  }
+
+  const Point &target = inA ? SQUARE_B : SQUARE_A;
+  if (inA) {
+    Enes100.println("START A -> TARGET B");
+  } else {
+    Enes100.println("START B -> TARGET A");
+  }
+
+  if (!driveToSquare(target, pose)) return;
+
+  if (inA) {
+    Enes100.println("ARRIVED B. Aligning to +X.");
+  } else {
+    Enes100.println("ARRIVED A. Aligning to +X.");
+  }
+
+  if (!alignToPositiveX(pose)) return;
+  printPose("Final pose:", pose);
+
+  // 回正时 Marker 可能随车身转动而偏离目标中心。
+  if (distanceTo(pose, target) > ARRIVAL_RADIUS_M) {
+    Enes100.println("STOP: aligned to +X, but Marker is over 6 cm from target center.");
+    return;
+  }
+
+  Enes100.println("TRANSFER COMPLETE. Aligned to +X. Motors OFF.");
+}
+
+void loop() {
+  // 每次开机或复位只执行一次换格。
+}
