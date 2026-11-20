@@ -1,6 +1,72 @@
 const int trigPin = A3;
 const int echoPin = A4;
-const float sensorToBottomMm = 62.0;
+
+const float sensorToBottomMm = 83.44;
+
+float readDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, 30000);
+
+  if (duration == 0) return -1;
+
+  return duration * 0.343 / 2.0;
+}
+
+float medianDistance() {
+  float readings[7];
+  int count = 0;
+
+  for (int i = 0; i < 7; i++) {
+    float d = readDistance();
+
+    if (d > 0) {
+      readings[count++] = d;
+    }
+
+    delay(70);
+  }
+
+  if (count < 4) return -1;
+
+  for (int i = 0; i < count - 1; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (readings[j] < readings[i]) {
+        float temp = readings[i];
+        readings[i] = readings[j];
+        readings[j] = temp;
+      }
+    }
+  }
+
+  return readings[count / 2];
+}
+
+float interpolate(float x, float x1, float y1,
+                  float x2, float y2) {
+  return y1 + (x - x1) * (y2 - y1) / (x2 - x1);
+}
+
+float calibrateDepth(float rawDepth) {
+  if (rawDepth <= 0.09) return 0;
+
+  if (rawDepth <= 25.47) {
+    return interpolate(rawDepth, 0.09, 0,
+                       25.47, 20);
+  }
+  else if (rawDepth <= 41.25) {
+    return interpolate(rawDepth, 25.47, 20,
+                       41.25, 32.5);
+  }
+  else {
+    return interpolate(rawDepth, 41.25, 32.5,
+                       47.69, 44.5);
+  }
+}
 
 void setup() {
   pinMode(trigPin, OUTPUT);
@@ -9,27 +75,60 @@ void setup() {
 }
 
 void loop() {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(15);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
+  const int maxReadings = 20;
+  float depths[maxReadings];
+  int count = 0;
 
-  unsigned long duration = pulseIn(echoPin, HIGH, 30000);
+  unsigned long startTime = millis();
 
-  if (duration == 0) {
-    Serial.println("No echo");
-  } else {
-    float distanceToWaterMm = duration * 0.343 / 2;
-    float waterDepthMm = sensorToBottomMm - distanceToWaterMm;
+  // Collect measurements for 10 seconds
+  while (millis() - startTime < 10000) {
+    float distance = medianDistance();
 
-    if (waterDepthMm < 0) {
-      Serial.println("Check sensor position");
-    } else {
-      Serial.print("Water depth: ");
-      Serial.print(waterDepthMm);
-      Serial.println(" mm");
+    if (distance > 0 && count < maxReadings) {
+      float rawDepth = sensorToBottomMm - distance;
+      depths[count++] = calibrateDepth(rawDepth);
+    }
+
+    delay(100);
+  }
+
+  if (count == 0) {
+    Serial.println("No valid readings");
+    return;
+  }
+
+  // Sort corrected depth measurements
+  for (int i = 0; i < count - 1; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (depths[j] < depths[i]) {
+        float temp = depths[i];
+        depths[i] = depths[j];
+        depths[j] = temp;
+      }
     }
   }
 
-  delay(500);
+  float minimum = depths[0];
+  float maximum = depths[count - 1];
+  float median = depths[count / 2];
+
+  Serial.println("------ 10 SECOND TEST ------");
+
+  Serial.print("Valid readings: ");
+  Serial.println(count);
+
+  Serial.print("Minimum depth: ");
+  Serial.println(minimum, 2);
+
+  Serial.print("Maximum depth: ");
+  Serial.println(maximum, 2);
+
+  Serial.print("Median depth: ");
+  Serial.println(median, 2);
+
+  Serial.print("Range: ");
+  Serial.println(maximum - minimum, 2);
+
+  Serial.println("----------------------------");
+}
