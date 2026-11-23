@@ -1,0 +1,369 @@
+#include <Arduino.h>
+#include <Enes100.h>
+#include <math.h>
+
+// ================= Configuration =================
+
+const byte WIFI_MODULE_TX = 8;
+const byte WIFI_MODULE_RX = 9;
+
+// 已实测确认的电机接线
+const byte IN1 = 6;
+const byte IN2 = 7;
+const byte IN3 = 4;
+const byte IN4 = 5;
+
+const float PI_F = 3.14159265f;
+
+// Marker 中心与任务参考点的暂定停车距离，单位米
+const float STANDOFF = 0.60f;
+
+const float POSITION_TOL = 0.04f;
+const float ANGLE_TOL = 0.12f;
+
+// ================= Runtime =================
+
+float px = 0;
+float py = 0;
+float heading = 0;
+float rawHeading = 0;
+float headingOffset = 0;
+
+float targetY = 0;
+float finalHeading = 0;
+float bestError = 100;
+
+bool poseOK = false;
+bool calibrated = false;
+byte goodPoses = 0;
+
+char startZone = '?';
+char targetZone = '?';
+
+// 0：待机
+// 1：前往目标外围
+// 2：朝向任务点
+// 3：停车等待任务
+byte stage = 0;
+
+unsigned long lastQuery = 0;
+unsigned long lastPrint = 0;
+unsigned long runStarted = 0;
+unsigned long progressAt = 0;
+
+float wrap(float a) {
+  while (a > PI_F) a -= 2 * PI_F;
+  while (a < -PI_F) a += 2 * PI_F;
+  return a;
+}
+
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void cancelRun() {
+  stopMotors();
+  stage = 0;
+}
+
+// 短脉冲移动，每次结束后停车，再读取定位。
+// 前进：D7、D4
+// 左转：D6、D4
+// 右转：D7、D5
+void pulse(char direction) {
+  stopMotors();
+
+  if (direction == 'f') {
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH);
+  } else if (direction == 'l') {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN3, HIGH);
+  } else if (direction == 'r') {
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN4, HIGH);
+  }
+
+  unsigned long began = millis();
+  unsigned long duration =
+      direction == 'f' ? 25UL : 35UL;
+
+  while (millis() - began < duration) {
+    if (Serial.available() && Serial.peek() == 'x') {
+      Serial.read();
+      cancelRun();
+      Serial.println(F("STOP by x"));
+      return;
+    }
+    delay(1);
+  }
+
+  stopMotors();
+}
+
+// 根据原场地图的坐标判断起点所在半区。
+// 这是 A/B 起点分区判断，不是任务方格边缘检测。
+char zoneNow() {
+  if (!poseOK || px < 0 || px > 0.8f) return '?';
+
+  if (py <= 0.85f) return 'B';
+  if (py >= 1.15f) return 'A';
+
+  return '?';
+}
+
+void readPose() {
+  stopMotors();
+  poseOK = false;
+
+  // Enes100 v6.2.4：
+  // 请求前清空缓存，避免把旧坐标当成新定位。
+  Enes100.location.x = -1;
+  Enes100.location.y = -1;
+  Enes100.location.theta = NAN;
+
+  unsigned long began = millis();
+  bool visible = Enes100.isVisible();
+
+  float x = Enes100.location.x;
+  float y = Enes100.location.y;
+  float a = Enes100.location.theta;
+
+  if (visible &&
+      millis() - began < 200UL &&
+      isfinite(x) &&
+      isfinite(y) &&
+      isfinite(a) &&
+      x >= 0 && x <= 4 &&
+      y >= 0 && y <= 2 &&
+      fabsf(a) <= 3.2f) {
+
+    px = x;
+    py = y;
+    rawHeading = a;
+    heading = wrap(a + headingOffset);
+    poseOK = true;
+
+    if (goodPoses < 3) ++goodPoses;
+
+  } else {
+    goodPoses = 0;
+
+    if (stage == 1 || stage == 2) {
+      cancelRun();
+      Serial.println(
+        F("STOP: pose lost; send 1 to restart")
+      );
+    }
+  }
+}
+
+void commands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == 'x') {
+      cancelRun();
+      Serial.println(F("STOP by x"));
+
+    } else if (c == 'c') {
+      if (stage != 0 || !poseOK || goodPoses < 3) {
+        Serial.println(
+          F("c refused: need IDLE + 3 valid poses")
+        );
+      } else {
+        // 发送 c 时，实体车头必须朝向场地 +X。
+        headingOffset = wrap(-rawHeading);
+        heading = 0;
+        calibrated = true;
+
+        Serial.println(
+          F("Heading calibrated: vehicle front = field +X")
+        );
+      }
+
+    } else if (c == '1') {
+      if (stage != 0) {
+        Serial.println(F("Send x before a new test"));
+
+      } else if (!poseOK || goodPoses < 3) {
+        Serial.println(
+          F("START refused: need 3 valid poses")
+        );
+
+      } else if (!calibrated) {
+        Serial.println(
+          F("START refused: point FRONT to +X, send c")
+        );
+
+      } else if (zoneNow() == '?') {
+        Serial.println(
+          F("START refused: outside A/B starting bands")
+        );
+
+      } else {
+        startZone = zoneNow();
+        targetZone = startZone == 'A' ? 'B' : 'A';
+
+        // 原场地图参考点：
+        // A = (0.5, 1.5)
+        // B = (0.5, 0.5)
+        targetY = targetZone == 'A'
+            ? 1.5f - STANDOFF
+            : 0.5f + STANDOFF;
+
+        finalHeading = targetZone == 'A'
+            ? PI_F / 2
+            : -PI_F / 2;
+
+        bestError = 100;
+        runStarted = millis();
+        progressAt = millis();
+        stage = 1;
+
+        Serial.print(F("START "));
+        Serial.print(startZone);
+        Serial.print(F(" -> "));
+        Serial.println(targetZone);
+      }
+    }
+  }
+}
+
+void navigation() {
+  if (stage != 1 && stage != 2) return;
+  if (!poseOK || goodPoses < 3) return;
+
+  if (millis() - runStarted > 60000UL) {
+    cancelRun();
+    Serial.println(F("STOP: 60 second timeout"));
+    return;
+  }
+
+  float dx = 0.5f - px;
+  float dy = targetY - py;
+  float distance = sqrtf(dx * dx + dy * dy);
+
+  if (stage == 1 && distance <= POSITION_TOL) {
+    stage = 2;
+    bestError = 100;
+    progressAt = millis();
+  }
+
+  float desired = stage == 1
+      ? atan2f(dy, dx)
+      : finalHeading;
+
+  float error = wrap(desired - heading);
+
+  float metric = stage == 1
+      ? distance
+      : fabsf(error);
+
+  float improvement = stage == 1 ? 0.01f : 0.04f;
+
+  if (metric < bestError - improvement) {
+    bestError = metric;
+    progressAt = millis();
+  }
+
+  if (millis() - progressAt > 15000UL) {
+    cancelRun();
+    Serial.println(
+      F("STOP: no progress; check heading / wheels")
+    );
+    return;
+  }
+
+  if (fabsf(error) > ANGLE_TOL) {
+    pulse(error > 0 ? 'l' : 'r');
+
+  } else if (stage == 1) {
+    pulse('f');
+
+  } else {
+    stopMotors();
+    stage = 3;
+
+    Serial.println(
+      F("WAIT_TASK: parked outside target; navigation stopped")
+    );
+  }
+}
+
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  stopMotors();
+
+  Serial.begin(115200);
+  Serial.println(
+    F("OTV A/B TEST | Marker 106 | NO OBSTACLE DETECTION")
+  );
+  Serial.println(F("Connecting Vision..."));
+  Serial.flush();
+
+  Enes100.begin(
+    "Water We Doing",
+    WATER,
+    106,
+    1116,
+    WIFI_MODULE_TX,
+    WIFI_MODULE_RX
+  );
+
+  Serial.println(
+    F("c=calibrate front along +X; 1=start; x=stop")
+  );
+}
+
+void loop() {
+  stopMotors();
+  commands();
+
+  if (millis() - lastQuery < 150UL) return;
+  lastQuery = millis();
+
+  readPose();
+  commands();
+
+  if (millis() - lastPrint >= 750UL) {
+    lastPrint = millis();
+
+    Serial.print(F("pose="));
+
+    if (poseOK) {
+      Serial.print(F("OK x="));
+      Serial.print(px, 3);
+      Serial.print(F(" y="));
+      Serial.print(py, 3);
+      Serial.print(F(" headingDeg="));
+      Serial.print(heading * 180 / PI_F, 1);
+    } else {
+      Serial.print(F("UNAVAILABLE"));
+    }
+
+    Serial.print(F(" zone="));
+    Serial.print(zoneNow());
+
+    Serial.print(F(" calibrated="));
+    Serial.print(calibrated);
+
+    Serial.print(F(" start="));
+    Serial.print(startZone);
+
+    Serial.print(F(" target="));
+    Serial.print(targetZone);
+
+    Serial.print(F(" stage="));
+    Serial.println(stage);
+  }
+
+  navigation();
+}
