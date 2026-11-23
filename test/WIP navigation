@@ -1,0 +1,1299 @@
+#include <Arduino.h>
+#include <Enes100.h>
+#include <math.h>
+
+#if !defined(__AVR_ATmega328P__)
+#error "Select Arduino Uno (Uno R3 / ATmega328P)."
+#endif
+
+// WiFi 模块 TX 接 Uno D8，模块 RX 接 Uno D9。
+// 如果实际接线相反，交换这两个值。
+const byte WIFI_MODULE_TX = 8;
+const byte WIFI_MODULE_RX = 9;
+
+const int MARKER_ID = 106;
+const int ROOM_NUMBER = 1116;
+
+// 建议 H-Bridge 接线，必须与实际接线一致。
+const byte LEFT_IN1 = 3;
+const byte LEFT_IN2 = 4;
+const byte LEFT_ENABLE = 5;
+
+const byte RIGHT_IN1 = 7;
+const byte RIGHT_IN2 = 11;
+const byte RIGHT_ENABLE = 6;
+
+// 某一侧电机方向相反时，将对应值改成 -1。
+const int LEFT_SIGN = 1;
+const int RIGHT_SIGN = 1;
+
+const byte FRONT_TRIG = A1;
+const byte FRONT_ECHO = A2;
+
+const int DRIVE_PWM = 145;
+const int TURN_PWM = 125;
+
+// false 表示发送 1 后开始移动。
+// true 表示在 A/B 稳定定位 5 秒后自动开始导航 1。
+const bool AUTO_START_NAV1 = false;
+
+// 长度单位为米，角度单位为弧度。
+// 以下安装参数需要按实际车辆测量。
+const float BODY_LENGTH = 0.252f;
+const float BODY_WIDTH = 0.248f;
+const float ARM_EXTENSION = 0.106f;
+
+// 前向超声波声学面相对车身中心的位置。
+const float SENSOR_FORWARD = 0.232f;
+const float SENSOR_LEFT = 0.0f;
+
+// 从 Marker 中心到车身中心的局部坐标偏移。
+// 后置 Marker 的这两个值需要实测。
+const float MARKER_TO_CENTER_FORWARD = 0.0f;
+const float MARKER_TO_CENTER_LEFT = 0.0f;
+
+// 车头朝向 = Marker 报告角度 + 这个修正值。
+const float MARKER_TO_FORWARD_ANGLE = 0.0f;
+
+// 车头最前端到任务参考点的目标距离。
+const float MISSION_STANDOFF = 0.10f;
+
+// 初始规划安全余量，需要实车验证。
+const float CLEARANCE = 0.05f;
+
+// 正常行驶时，超声波小于此距离则停车。
+const float TRANSIT_STOP = 0.18f;
+
+const float POSITION_TOLERANCE = 0.03f;
+const float ANGLE_TOLERANCE = 0.07f;
+const float PI_VALUE = 3.141592654f;
+
+struct Point {
+  float x, y;
+};
+
+struct Pose {
+  float x, y, angle;
+  bool valid;
+};
+
+enum State : byte {
+  READY,
+  APPROACH,
+  FACE_MISSION,
+  WAIT_MISSION,
+  BACK_TO_GAP,
+  GO_STAGING,
+  SCAN,
+  PLAN,
+  FOLLOW,
+  ENTER_GOAL,
+  FINISHED,
+  FAULT
+};
+
+enum MoveResult : byte {
+  ARRIVED,
+  MOVING,
+  BLOCKED,
+  NO_RANGE
+};
+
+// 使用小型栅格，适应 Uno R3 的内存。
+// 格子边长 0.2 m，障碍物按车身包络膨胀。
+class Map {
+public:
+  static const byte GRID_COLUMNS = 20;
+  static const byte GRID_ROWS = 10;
+  static const byte GRID_CELLS = 200;
+
+  byte occupied[25] = {};
+  byte parent[GRID_CELLS];
+
+  // 规划时作为 BFS 队列，规划结束后保存路线。
+  byte route[GRID_CELLS];
+  byte length = 0;
+
+  static Point center(byte index) {
+    return {
+      (index % GRID_COLUMNS + 0.5f) * 0.2f,
+      (index / GRID_COLUMNS + 0.5f) * 0.2f
+    };
+  }
+
+  static int index(Point point) {
+    if (point.x < 0 || point.x >= 4 ||
+        point.y < 0 || point.y >= 2) {
+      return -1;
+    }
+
+    return int(point.y / 0.2f) * GRID_COLUMNS
+         + int(point.x / 0.2f);
+  }
+
+  bool hit(byte index) const {
+    return occupied[index / 8]
+         & (1 << (index % 8));
+  }
+
+  void clear() {
+    memset(occupied, 0, sizeof(occupied));
+    length = 0;
+  }
+
+  void addRay(Pose pose, float range) {
+    const float cosine = cosf(pose.angle);
+    const float sine = sinf(pose.angle);
+
+    Point endpoint = {
+      pose.x
+        + SENSOR_FORWARD * cosine
+        - SENSOR_LEFT * sine
+        + range * cosine,
+
+      pose.y
+        + SENSOR_FORWARD * sine
+        + SENSOR_LEFT * cosine
+        + range * sine
+    };
+
+    // 已知场地墙壁由边界检查处理。
+    if (endpoint.x < 0.03f ||
+        endpoint.x > 3.97f ||
+        endpoint.y < 0.03f ||
+        endpoint.y > 1.97f) {
+      return;
+    }
+
+    int cell = index(endpoint);
+
+    if (cell >= 0) {
+      occupied[cell / 8] |= 1 << (cell % 8);
+    }
+  }
+
+  bool blocked(Point point) const {
+    float radius =
+      hypotf(
+        BODY_LENGTH / 2 + ARM_EXTENSION,
+        BODY_WIDTH / 2
+      ) + CLEARANCE;
+
+    if (point.x < radius ||
+        point.x > 4 - radius ||
+        point.y < radius ||
+        point.y > 2 - radius) {
+      return true;
+    }
+
+    // 最后一道分界的下半部分禁止通过。
+    if (fabsf(point.x - 3.4f) <= radius + 0.025f &&
+        point.y <= 1 + radius) {
+      return true;
+    }
+
+    // 任务区半边长暂按 0.20 m。
+    for (byte site = 0; site < 2; ++site) {
+      float y = site ? 1.5f : 0.5f;
+
+      float dx = fmaxf(
+        fabsf(point.x - 0.5f) - 0.20f,
+        0
+      );
+
+      float dy = fmaxf(
+        fabsf(point.y - y) - 0.20f,
+        0
+      );
+
+      if (hypotf(dx, dy) < radius) {
+        return true;
+      }
+    }
+
+    for (int cell = 0; cell < GRID_CELLS; ++cell) {
+      if (!hit(cell)) {
+        continue;
+      }
+
+      Point obstacle = center(cell);
+
+      if (hypotf(
+            point.x - obstacle.x,
+            point.y - obstacle.y
+          ) < radius + 0.142f) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool plan(Point from, Point goal) {
+    int start = index(from);
+    int finish = index(goal);
+
+    length = 0;
+
+    if (start < 0 ||
+        finish < 0 ||
+        blocked(from) ||
+        blocked(center(start)) ||
+        blocked(center(finish))) {
+      return false;
+    }
+
+    memset(parent, 255, sizeof(parent));
+    parent[start] = start;
+
+    int head = 0;
+    int tail = 0;
+
+    route[tail++] = start;
+
+    while (head < tail) {
+      byte current = route[head++];
+
+      if (current == finish) {
+        byte cursor = finish;
+
+        while (true) {
+          if (length >= GRID_CELLS) {
+            return false;
+          }
+
+          route[length++] = cursor;
+
+          if (cursor == start) {
+            break;
+          }
+
+          cursor = parent[cursor];
+        }
+
+        for (int a = 0, b = length - 1;
+             a < b;
+             ++a, --b) {
+          byte temporary = route[a];
+          route[a] = route[b];
+          route[b] = temporary;
+        }
+
+        return true;
+      }
+
+      for (byte direction = 0;
+           direction < 4;
+           ++direction) {
+        int x = current % GRID_COLUMNS;
+        int y = current / GRID_COLUMNS;
+
+        if (direction == 0) {
+          ++x;
+        }
+
+        if (direction == 1) {
+          --x;
+        }
+
+        if (direction == 2) {
+          ++y;
+        }
+
+        if (direction == 3) {
+          --y;
+        }
+
+        if (x < 0 ||
+            x >= GRID_COLUMNS ||
+            y < 0 ||
+            y >= GRID_ROWS) {
+          continue;
+        }
+
+        int next = y * GRID_COLUMNS + x;
+
+        if (parent[next] != 255 ||
+            blocked(center(next))) {
+          continue;
+        }
+
+        Point a = center(current);
+        Point b = center(next);
+
+        if (blocked({
+              (a.x + b.x) / 2,
+              (a.y + b.y) / 2
+            })) {
+          continue;
+        }
+
+        parent[next] = current;
+
+        if (tail >= GRID_CELLS) {
+          return false;
+        }
+
+        route[tail++] = next;
+      }
+    }
+
+    return false;
+  }
+};
+
+Map arena;
+
+Pose pose = {0, 0, 0, false};
+Pose progress = {0, 0, 0, false};
+
+Point mission = {0.5f, 1.5f};
+Point missionStop = {0.5f, 1.0f};
+
+State state = READY;
+
+const __FlashStringHelper *message = nullptr;
+const __FlashStringHelper *poseMessage = nullptr;
+
+float frontRange = NAN;
+float scanOrigin = 0;
+float samples[3];
+
+bool frontValid = false;
+bool running = false;
+bool autoAllowed = AUTO_START_NAV1;
+
+byte networkState = 255;
+byte scanStep = 0;
+byte sampleCount = 0;
+byte routeStep = 0;
+
+unsigned int motorTimeWithoutProgress = 0;
+
+unsigned long phaseAt = 0;
+unsigned long poseAt = 0;
+unsigned long lastCycle = 0;
+unsigned long lastPrint = 0;
+unsigned long settledAt = 0;
+unsigned long rangeAt = 0;
+unsigned long lastSampleAt = 0;
+unsigned long stableSince = 0;
+
+bool settled = false;
+
+// 显式函数声明，避免 Arduino 自动生成声明时的类型问题。
+float wrapAngle(float angle);
+float separation(Point a, Point b);
+char startZone();
+
+void stopMotors();
+void setSide(byte in1, byte in2, byte enable, int pwm);
+void pulseMotors(int left, int right, unsigned int duration);
+
+bool turnTo(float angle);
+
+MoveResult driveTo(
+  Point target,
+  float stopDistance,
+  bool reverse = false
+);
+
+void changeState(State next);
+void fail(const __FlashStringHelper *reason);
+void beginScan();
+
+bool readPose();
+void readRange();
+
+void startMission();
+void startDestination();
+bool insideDestination();
+
+void navigation();
+void commands();
+void printStatus();
+
+void setup();
+void loop();
+
+float wrapAngle(float angle) {
+  while (angle > PI_VALUE) {
+    angle -= 2 * PI_VALUE;
+  }
+
+  while (angle < -PI_VALUE) {
+    angle += 2 * PI_VALUE;
+  }
+
+  return angle;
+}
+
+float separation(Point a, Point b) {
+  return hypotf(a.x - b.x, a.y - b.y);
+}
+
+char startZone() {
+  if (!pose.valid ||
+      pose.x < 0 ||
+      pose.x > 0.8f ||
+      pose.y < 0 ||
+      pose.y > 2) {
+    return '?';
+  }
+
+  if (pose.y <= 0.85f) {
+    return 'B';
+  }
+
+  if (pose.y >= 1.15f) {
+    return 'A';
+  }
+
+  return '?';
+}
+
+void stopMotors() {
+  analogWrite(LEFT_ENABLE, 0);
+  analogWrite(RIGHT_ENABLE, 0);
+
+  digitalWrite(LEFT_IN1, LOW);
+  digitalWrite(LEFT_IN2, LOW);
+
+  digitalWrite(RIGHT_IN1, LOW);
+  digitalWrite(RIGHT_IN2, LOW);
+}
+
+void setSide(
+  byte in1,
+  byte in2,
+  byte enable,
+  int pwm
+) {
+  analogWrite(enable, 0);
+
+  digitalWrite(
+    in1,
+    pwm > 0 ? HIGH : LOW
+  );
+
+  digitalWrite(
+    in2,
+    pwm < 0 ? HIGH : LOW
+  );
+
+  analogWrite(
+    enable,
+    constrain(abs(pwm), 0, 255)
+  );
+}
+
+void pulseMotors(
+  int left,
+  int right,
+  unsigned int duration
+) {
+  setSide(
+    LEFT_IN1,
+    LEFT_IN2,
+    LEFT_ENABLE,
+    left * LEFT_SIGN
+  );
+
+  setSide(
+    RIGHT_IN1,
+    RIGHT_IN2,
+    RIGHT_ENABLE,
+    right * RIGHT_SIGN
+  );
+
+  unsigned long started = millis();
+
+  while (millis() - started < duration) {
+    if (Serial.available() &&
+        (Serial.peek() == 'x' ||
+         Serial.peek() == 'X')) {
+      Serial.read();
+      stopMotors();
+
+      running = false;
+      autoAllowed = false;
+      state = READY;
+      message = F("Stopped by x");
+
+      return;
+    }
+
+    delay(1);
+  }
+
+  stopMotors();
+  motorTimeWithoutProgress += duration;
+}
+
+bool turnTo(float angle) {
+  float error = wrapAngle(
+    angle - pose.angle
+  );
+
+  if (fabsf(error) <= ANGLE_TOLERANCE) {
+    return true;
+  }
+
+  unsigned int duration =
+    fabsf(error) < 0.20f ? 25 : 50;
+
+  if (error > 0) {
+    pulseMotors(
+      -TURN_PWM,
+      TURN_PWM,
+      duration
+    );
+  }
+  else {
+    pulseMotors(
+      TURN_PWM,
+      -TURN_PWM,
+      duration
+    );
+  }
+
+  return false;
+}
+
+MoveResult driveTo(
+  Point target,
+  float stopDistance,
+  bool reverse
+) {
+  float distance = separation(
+    {pose.x, pose.y},
+    target
+  );
+
+  if (distance <= POSITION_TOLERANCE) {
+    return ARRIVED;
+  }
+
+  float angle = atan2f(
+    target.y - pose.y,
+    target.x - pose.x
+  );
+
+  if (reverse) {
+    angle = wrapAngle(
+      angle + PI_VALUE
+    );
+  }
+
+  if (!turnTo(angle)) {
+    return MOVING;
+  }
+
+  if (!reverse && !frontValid) {
+    message = F("Waiting for valid front echo");
+    return NO_RANGE;
+  }
+
+  if (!reverse && frontRange < stopDistance) {
+    message = F("Front obstacle: stopped");
+    return BLOCKED;
+  }
+
+  int pwm = reverse
+    ? -DRIVE_PWM
+    : DRIVE_PWM;
+
+  pulseMotors(
+    pwm,
+    pwm,
+    distance < 0.12f ? 30 : 60
+  );
+
+  return MOVING;
+}
+
+void changeState(State next) {
+  state = next;
+  phaseAt = millis();
+}
+
+void fail(const __FlashStringHelper *reason) {
+  stopMotors();
+
+  running = false;
+  autoAllowed = false;
+  state = FAULT;
+  message = reason;
+}
+
+void beginScan() {
+  scanOrigin = pose.angle;
+  scanStep = 0;
+  sampleCount = 0;
+  settled = false;
+
+  changeState(SCAN);
+
+  message = F("Scanning 360 degrees");
+}
+
+bool readPose() {
+  stopMotors();
+  pose.valid = false;
+
+  networkState = Enes100.state();
+
+  if (networkState != 1) {
+    poseMessage = F("WIFI/VISION DISCONNECTED");
+    return false;
+  }
+
+  // 针对官方 ENES100 v6.2.4 的公开位置缓存。
+  Enes100.location.x = -1;
+  Enes100.location.y = -1;
+  Enes100.location.theta = NAN;
+
+  unsigned long started = millis();
+
+  bool visible = Enes100.isVisible();
+
+  float x = Enes100.location.x;
+  float y = Enes100.location.y;
+  float angle = Enes100.location.theta;
+
+  if (!visible) {
+    poseMessage = F("MARKER 106 NOT VISIBLE");
+    return false;
+  }
+
+  if (millis() - started >= 100UL ||
+      !isfinite(x) ||
+      !isfinite(y) ||
+      !isfinite(angle) ||
+      x < 0 ||
+      x > 4 ||
+      y < 0 ||
+      y > 2 ||
+      fabsf(angle) > 3.20f) {
+    poseMessage = F("NO COMPLETE NEW POSE");
+    return false;
+  }
+
+  angle = wrapAngle(
+    angle + MARKER_TO_FORWARD_ANGLE
+  );
+
+  pose = {
+    x
+      + MARKER_TO_CENTER_FORWARD * cosf(angle)
+      - MARKER_TO_CENTER_LEFT * sinf(angle),
+
+    y
+      + MARKER_TO_CENTER_FORWARD * sinf(angle)
+      + MARKER_TO_CENTER_LEFT * cosf(angle),
+
+    angle,
+    true
+  };
+
+  if (pose.x < 0 ||
+      pose.x > 4 ||
+      pose.y < 0 ||
+      pose.y > 2) {
+    pose.valid = false;
+    poseMessage = F("BODY CENTER OUTSIDE FIELD");
+    return false;
+  }
+
+  poseAt = millis();
+  poseMessage = F("OK");
+
+  return true;
+}
+
+void readRange() {
+  frontValid = false;
+
+  digitalWrite(FRONT_TRIG, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(FRONT_TRIG, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(FRONT_TRIG, LOW);
+
+  unsigned long echo = pulseIn(
+    FRONT_ECHO,
+    HIGH,
+    25000UL
+  );
+
+  rangeAt = millis();
+
+  if (!echo) {
+    return;
+  }
+
+  frontRange =
+    echo * 0.000343f / 2;
+
+  frontValid =
+    frontRange >= 0.02f &&
+    frontRange <= 4.0f;
+}
+
+void startMission() {
+  if (!pose.valid ||
+      startZone() == '?') {
+    message = F("Need valid A/B pose");
+    return;
+  }
+
+  bool fromA =
+    startZone() == 'A';
+
+  mission = {
+    0.5f,
+    fromA ? 0.5f : 1.5f
+  };
+
+  float offset =
+    BODY_LENGTH / 2
+    + ARM_EXTENSION
+    + MISSION_STANDOFF;
+
+  missionStop = {
+    mission.x,
+    mission.y + (fromA ? offset : -offset)
+  };
+
+  running = true;
+  autoAllowed = false;
+  motorTimeWithoutProgress = 0;
+
+  progress = pose;
+
+  arena.clear();
+  changeState(APPROACH);
+
+  message = F("Nav1: approaching opposite mission site");
+}
+
+void startDestination() {
+  if (!pose.valid) {
+    message = F("Need valid pose");
+    return;
+  }
+
+  running = true;
+  autoAllowed = false;
+  motorTimeWithoutProgress = 0;
+
+  progress = pose;
+
+  arena.clear();
+
+  if (pose.x < 0.8f) {
+    changeState(GO_STAGING);
+    message = F("Moving to scan staging point");
+  }
+  else {
+    beginScan();
+  }
+}
+
+bool insideDestination() {
+  const float frontExtent =
+    BODY_LENGTH / 2 + ARM_EXTENSION;
+
+  for (byte corner = 0;
+       corner < 4;
+       ++corner) {
+    float forward = corner < 2
+      ? frontExtent
+      : -BODY_LENGTH / 2;
+
+    float left = corner % 2
+      ? BODY_WIDTH / 2
+      : -BODY_WIDTH / 2;
+
+    float x =
+      pose.x
+      + forward * cosf(pose.angle)
+      - left * sinf(pose.angle);
+
+    float y =
+      pose.y
+      + forward * sinf(pose.angle)
+      + left * cosf(pose.angle);
+
+    if (x < 3.4f ||
+        x > 4.0f ||
+        y < 0.0f ||
+        y > 2.0f) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void navigation() {
+  if (!running ||
+      !pose.valid ||
+      millis() - poseAt > 200UL) {
+    return;
+  }
+
+  bool positionChanged =
+    separation(
+      {pose.x, pose.y},
+      {progress.x, progress.y}
+    ) > 0.012f;
+
+  bool angleChanged =
+    fabsf(
+      wrapAngle(
+        pose.angle - progress.angle
+      )
+    ) > 0.04f;
+
+  if (!progress.valid ||
+      positionChanged ||
+      angleChanged) {
+    progress = pose;
+    motorTimeWithoutProgress = 0;
+  }
+
+  if (motorTimeWithoutProgress > 600) {
+    fail(
+      F("No movement feedback: check PWM/direction")
+    );
+    return;
+  }
+
+  if (state != WAIT_MISSION &&
+      millis() - phaseAt > 120000UL) {
+    fail(F("Stage timeout"));
+    return;
+  }
+
+  switch (state) {
+  case APPROACH:
+    if (driveTo(
+          missionStop,
+          0.07f
+        ) == ARRIVED) {
+      changeState(FACE_MISSION);
+    }
+    break;
+
+  case FACE_MISSION:
+    if (turnTo(
+          atan2f(
+            mission.y - pose.y,
+            mission.x - pose.x
+          )
+        )) {
+      Point tip = {
+        pose.x
+          + (BODY_LENGTH / 2 + ARM_EXTENSION)
+          * cosf(pose.angle),
+
+        pose.y
+          + (BODY_LENGTH / 2 + ARM_EXTENSION)
+          * sinf(pose.angle)
+      };
+
+      if (separation(tip, mission) > 0.15f) {
+        fail(
+          F("Check mission reference/geometry")
+        );
+        break;
+      }
+
+      changeState(WAIT_MISSION);
+
+      message =
+        F("Nav1 reached. Complete mission; send m");
+    }
+    break;
+
+  case WAIT_MISSION:
+    break;
+
+  case BACK_TO_GAP:
+    // 沿刚刚接近任务点的通道退回。
+    // 实车必须确认后方通道保持畅通。
+    if (driveTo(
+          {0.5f, 1.0f},
+          0,
+          true
+        ) == ARRIVED) {
+      changeState(GO_STAGING);
+    }
+    break;
+
+  case GO_STAGING:
+    if (driveTo(
+          {1.1f, 1.0f},
+          TRANSIT_STOP
+        ) == ARRIVED) {
+      beginScan();
+    }
+    break;
+
+  case SCAN: {
+    float targetAngle = wrapAngle(
+      scanOrigin
+      + scanStep * PI_VALUE / 9
+    );
+
+    if (!turnTo(targetAngle)) {
+      settled = false;
+      sampleCount = 0;
+      break;
+    }
+
+    if (scanStep == 18) {
+      changeState(PLAN);
+      break;
+    }
+
+    if (!settled) {
+      settled = true;
+      settledAt = millis();
+      sampleCount = 0;
+      break;
+    }
+
+    // 无回波保持未知，等待一秒后跳过该方向。
+    if (!frontValid &&
+        millis() - settledAt > 1000UL) {
+      ++scanStep;
+      settled = false;
+      break;
+    }
+
+    if (!frontValid ||
+        millis() - settledAt < 150UL ||
+        rangeAt == lastSampleAt) {
+      break;
+    }
+
+    lastSampleAt = rangeAt;
+    samples[sampleCount++] = frontRange;
+
+    if (sampleCount == 3) {
+      for (byte a = 0; a < 2; ++a) {
+        for (byte b = a + 1; b < 3; ++b) {
+          if (samples[a] > samples[b]) {
+            float temporary = samples[a];
+            samples[a] = samples[b];
+            samples[b] = temporary;
+          }
+        }
+      }
+
+      arena.addRay(
+        pose,
+        samples[1]
+      );
+
+      ++scanStep;
+      settled = false;
+      sampleCount = 0;
+    }
+    break;
+  }
+
+  case PLAN:
+    if (!arena.plan(
+          {pose.x, pose.y},
+          {3.5f, 1.5f}
+        )) {
+      fail(
+        F("No route with measured map/clearance")
+      );
+      break;
+    }
+
+    routeStep = 0;
+
+    changeState(FOLLOW);
+
+    message =
+      F("Following route toward upper gate");
+    break;
+
+  case FOLLOW: {
+    if (routeStep >= arena.length) {
+      changeState(ENTER_GOAL);
+      break;
+    }
+
+    MoveResult result = driveTo(
+      Map::center(
+        arena.route[routeStep]
+      ),
+      TRANSIT_STOP
+    );
+
+    if (result == ARRIVED) {
+      ++routeStep;
+      phaseAt = millis();
+    }
+
+    if (result == BLOCKED) {
+      arena.addRay(
+        pose,
+        frontRange
+      );
+
+      beginScan();
+    }
+    break;
+  }
+
+  case ENTER_GOAL:
+    if (driveTo(
+          {3.6f, 1.5f},
+          TRANSIT_STOP
+        ) == ARRIVED &&
+        turnTo(0)) {
+      if (insideDestination()) {
+        running = false;
+        changeState(FINISHED);
+
+        message =
+          F("Nav3 destination reached; verify footprint");
+      }
+      else {
+        fail(
+          F("Goal footprint check failed")
+        );
+      }
+    }
+    break;
+
+  default:
+    break;
+  }
+}
+
+void commands() {
+  while (Serial.available()) {
+    char command = Serial.read();
+
+    switch (command) {
+    case '1':
+    case 'g':
+    case 'G':
+      startMission();
+      break;
+
+    case '3':
+      startDestination();
+      break;
+
+    case 'm':
+    case 'M':
+      if (state == WAIT_MISSION &&
+          pose.valid) {
+        changeState(BACK_TO_GAP);
+
+        message =
+          F("Mission complete; navigating to destination");
+      }
+      else {
+        message =
+          F("m accepted only at mission wait");
+      }
+      break;
+
+    case 'x':
+    case 'X':
+      stopMotors();
+
+      running = false;
+      autoAllowed = false;
+      state = READY;
+
+      message = F("Stopped by x");
+      break;
+
+    case 'f':
+    case 'l':
+    case 'r':
+      if (running) {
+        message =
+          F("Send x before wheel test");
+        break;
+      }
+
+      if (command == 'f') {
+        pulseMotors(
+          110,
+          110,
+          120
+        );
+      }
+
+      if (command == 'l') {
+        pulseMotors(
+          -110,
+          110,
+          120
+        );
+      }
+
+      if (command == 'r') {
+        pulseMotors(
+          110,
+          -110,
+          120
+        );
+      }
+      break;
+
+    case '\r':
+    case '\n':
+    case ' ':
+      break;
+
+    default:
+      message =
+        F("Commands: 1 Nav1; 3 Nav3; m done; x stop; f/l/r wheel tests");
+      break;
+    }
+  }
+}
+
+void printStatus() {
+  Serial.print(F("net="));
+  Serial.print(networkState);
+
+  Serial.print(F(" pose="));
+  Serial.print(poseMessage);
+
+  if (pose.valid) {
+    Serial.print(F(" x="));
+    Serial.print(pose.x, 3);
+
+    Serial.print(F(" y="));
+    Serial.print(pose.y, 3);
+
+    Serial.print(F(" deg="));
+    Serial.print(
+      pose.angle * 57.29578f,
+      1
+    );
+  }
+
+  Serial.print(F(" zone="));
+  Serial.print(startZone());
+
+  Serial.print(F(" front="));
+
+  if (frontValid) {
+    Serial.print(
+      frontRange,
+      3
+    );
+  }
+  else {
+    Serial.print(F("UNKNOWN"));
+  }
+
+  Serial.print(F(" run="));
+  Serial.print(running);
+
+  Serial.print(F(" stage="));
+  Serial.print(byte(state));
+
+  Serial.print(F(" | "));
+  Serial.println(message);
+}
+
+void setup() {
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(LEFT_ENABLE, OUTPUT);
+
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+  pinMode(RIGHT_ENABLE, OUTPUT);
+
+  stopMotors();
+
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+
+  Serial.begin(115200);
+  delay(1000);
+
+  message =
+    F("READY: 1=mission; 3=destination; m=mission done; x=STOP");
+
+  poseMessage = F("WAITING");
+
+  Serial.println(
+    F("UNO R3 MS6 | Marker106 | MODULE TX->8 RX->9 | H-bridge pins must match")
+  );
+
+  Serial.println(
+    F("Initializing Vision...")
+  );
+
+  Serial.flush();
+
+  Enes100.begin(
+    "Water We Doing",
+    WATER,
+    106,
+    1116,
+    6,
+    7
+  );
+}
+
+void loop() {
+  stopMotors();
+  commands();
+
+  if (millis() - lastCycle < 150UL) {
+    delay(1);
+    return;
+  }
+
+  lastCycle = millis();
+
+  bool valid = readPose();
+
+  readRange();
+  commands();
+
+  if (valid && startZone() != '?') {
+    if (!stableSince) {
+      stableSince = millis();
+    }
+
+    if (autoAllowed &&
+        state == READY &&
+        millis() - stableSince >= 5000UL) {
+      startMission();
+    }
+  }
+  else {
+    stableSince = 0;
+  }
+
+  // 先在停车状态下打印信息，再执行短时运动。
+  if (millis() - lastPrint >= 750UL) {
+    lastPrint = millis();
+    printStatus();
+  }
+
+  navigation();
+  stopMotors();
+}
